@@ -29,6 +29,11 @@ impl TcpIncoming {
     ///
     /// Returns a TcpIncoming if the socket address was successfully bound.
     ///
+    /// If the process was launched under a socket-activation manager
+    /// that passed a listening socket matching `addr` via the
+    /// `LISTEN_FDS` / `LISTEN_PID` environment variables, that inherited
+    /// descriptor is adopted instead of opening a new socket.
+    ///
     /// # Examples
     /// ```no_run
     /// # use tower_service::Service;
@@ -57,7 +62,11 @@ impl TcpIncoming {
     /// # Ok(())
     /// # }
     pub fn bind(addr: SocketAddr) -> std::io::Result<Self> {
-        let std_listener = StdTcpListener::bind(addr)?;
+        let std_listener = match find_preallocated_fd(addr) {
+            Some(listener) => listener,
+            None => StdTcpListener::bind(addr)?,
+        };
+
         std_listener.set_nonblocking(true)?;
 
         Ok(TcpListener::from_std(std_listener)?.into())
@@ -224,10 +233,129 @@ fn make_keepalive(
     dirty.then_some(keepalive)
 }
 
+#[cfg(unix)]
+fn find_preallocated_fd(addr: SocketAddr) -> Option<StdTcpListener> {
+    use std::os::unix::io::FromRawFd;
+
+    let fd = super::socket_activation::find_preallocated_fd(|fd| tcp_fd_matches(fd, addr))?;
+
+    Some(unsafe { StdTcpListener::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn tcp_fd_matches(fd: std::os::unix::io::RawFd, requested: SocketAddr) -> bool {
+    use std::mem::ManuallyDrop;
+    use std::os::unix::io::FromRawFd;
+
+    let listener = ManuallyDrop::new(unsafe { StdTcpListener::from_raw_fd(fd) });
+    matches!(listener.local_addr(), Ok(local) if socket_addr_matches(local, requested))
+}
+
+#[cfg(unix)]
+fn socket_addr_matches(inherited: SocketAddr, requested: SocketAddr) -> bool {
+    use std::net::IpAddr;
+
+    if inherited.port() != requested.port() {
+        return false;
+    }
+
+    // Normalize IPv4-mapped IPv6 addresses to plain IPv4.
+    fn normalize(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => IpAddr::V6(v6),
+            },
+            v4 => v4,
+        }
+    }
+
+    let inherited_ip = normalize(inherited.ip());
+    let requested_ip = normalize(requested.ip());
+
+    if inherited_ip == requested_ip {
+        return true;
+    }
+
+    requested_ip.is_unspecified() && inherited_ip.is_unspecified()
+}
+
+#[cfg(not(unix))]
+fn find_preallocated_fd(_addr: SocketAddr) -> Option<StdTcpListener> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use crate::transport::server::TcpIncoming;
+    use serial_test::serial;
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_addr_matches_cases() {
+        use super::socket_addr_matches;
+
+        let parse = |s: &str| -> std::net::SocketAddr { s.parse().unwrap() };
+
+        assert!(socket_addr_matches(
+            parse("127.0.0.1:50051"),
+            parse("127.0.0.1:50051")
+        ));
+
+        assert!(!socket_addr_matches(
+            parse("127.0.0.1:50051"),
+            parse("127.0.0.1:1234")
+        ));
+
+        assert!(!socket_addr_matches(
+            parse("127.0.0.1:50051"),
+            parse("192.168.0.1:50051")
+        ));
+
+        assert!(socket_addr_matches(
+            parse("[::]:50051"),
+            parse("0.0.0.0:50051")
+        ));
+        assert!(socket_addr_matches(
+            parse("0.0.0.0:50051"),
+            parse("[::]:50051")
+        ));
+
+        assert!(socket_addr_matches(
+            parse("[::ffff:127.0.0.1]:50051"),
+            parse("127.0.0.1:50051")
+        ));
+
+        assert!(!socket_addr_matches(
+            parse("127.0.0.1:50051"),
+            parse("0.0.0.0:50051")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn is_listening_stream_socket_cases() {
+        use crate::transport::server::socket_activation::is_listening_stream_socket;
+        use std::os::unix::io::AsRawFd;
+
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(is_listening_stream_socket(tcp.as_raw_fd()));
+
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(!is_listening_stream_socket(udp.as_raw_fd()));
+
+        let raw = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        assert!(!is_listening_stream_socket(raw.as_raw_fd()));
+    }
+
     #[tokio::test]
+    #[serial]
     async fn one_tcpincoming_at_a_time() {
         let addr = "127.0.0.1:1322".parse().unwrap();
         {
@@ -235,5 +363,48 @@ mod tests {
             let _t2 = TcpIncoming::bind(addr).unwrap_err();
         }
         let _t3 = TcpIncoming::bind(addr).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn socket_activation_uses_preallocated_fd() {
+        use std::net::TcpListener as StdTcpListener;
+        use std::os::unix::io::IntoRawFd;
+
+        const SD_FD: libc::c_int = 3;
+
+        let pre_listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = pre_listener.local_addr().unwrap();
+        let pre_fd = pre_listener.into_raw_fd();
+
+        let saved_fd = unsafe { libc::dup(SD_FD) };
+        unsafe {
+            libc::dup2(pre_fd, SD_FD);
+            libc::close(pre_fd);
+        }
+
+        unsafe {
+            std::env::set_var("LISTEN_PID", std::process::id().to_string());
+            std::env::set_var("LISTEN_FDS", "1");
+        }
+
+        let incoming = TcpIncoming::bind(addr).unwrap();
+        assert_eq!(incoming.local_addr().unwrap(), addr);
+        drop(incoming);
+
+        unsafe {
+            std::env::remove_var("LISTEN_PID");
+            std::env::remove_var("LISTEN_FDS");
+        }
+
+        unsafe {
+            if saved_fd >= 0 {
+                libc::dup2(saved_fd, SD_FD);
+                libc::close(saved_fd);
+            } else {
+                libc::close(SD_FD);
+            }
+        }
     }
 }
