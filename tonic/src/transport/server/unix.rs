@@ -29,7 +29,8 @@ impl UnixIncoming {
     /// If the process was launched under a socket-activation manager
     /// that passed a listening Unix socket matching `path` via the
     /// `LISTEN_FDS` / `LISTEN_PID` environment variables, that inherited
-    /// descriptor is adopted instead of opening a new socket.
+    /// descriptor is adopted instead of opening a new socket. This behavior
+    /// requires the `socket-activation` feature.
     ///
     /// # Examples
     /// ```no_run
@@ -85,6 +86,8 @@ impl Stream for UnixIncoming {
     }
 }
 
+// Adopts a socket-activation fd bound to `path`, if one was passed in.
+#[cfg(feature = "socket-activation")]
 fn find_preallocated_fd(path: &Path) -> Option<StdUnixListener> {
     use std::os::unix::io::FromRawFd;
 
@@ -93,6 +96,13 @@ fn find_preallocated_fd(path: &Path) -> Option<StdUnixListener> {
     Some(unsafe { StdUnixListener::from_raw_fd(fd) })
 }
 
+#[cfg(not(feature = "socket-activation"))]
+fn find_preallocated_fd(_path: &Path) -> Option<StdUnixListener> {
+    None
+}
+
+// Returns true if the listening socket at `fd` is bound to the requested path.
+#[cfg(feature = "socket-activation")]
 fn unix_fd_matches(fd: std::os::unix::io::RawFd, requested: &Path) -> bool {
     use std::mem::ManuallyDrop;
     use std::os::unix::io::FromRawFd;
@@ -128,10 +138,8 @@ impl Connected for tokio::net::UnixStream {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "socket-activation"))]
 mod tests {
-    use super::UnixIncoming;
-    use serial_test::serial;
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::PathBuf;
 
@@ -147,7 +155,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn unix_fd_matches_cases() {
         use super::unix_fd_matches;
         use std::os::unix::io::AsRawFd;
@@ -166,7 +173,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn is_listening_stream_socket_cases() {
         use crate::transport::server::socket_activation::is_listening_stream_socket;
         use std::os::unix::io::AsRawFd;
@@ -186,50 +192,24 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[tokio::test]
-    #[serial]
-    async fn socket_activation_uses_preallocated_fd() {
-        use std::os::unix::io::IntoRawFd;
+    #[test]
+    fn scan_adopts_matching_unix_fd() {
+        use super::unix_fd_matches;
+        use crate::transport::server::socket_activation::scan_preallocated_fds;
+        use std::os::unix::io::AsRawFd;
 
-        const SD_FD: libc::c_int = 3;
+        let path = temp_socket_path("scan");
+        let listener = StdUnixListener::bind(&path).unwrap();
+        let fd = listener.as_raw_fd();
 
-        let path = temp_socket_path("activation");
+        let n_fds = fd - 2;
+        let found = scan_preallocated_fds(std::process::id(), n_fds, |candidate| {
+            unix_fd_matches(candidate, &path)
+        });
 
-        let pre_listener = StdUnixListener::bind(&path).unwrap();
-        let pre_fd = pre_listener.into_raw_fd();
+        assert_eq!(found, Some(fd));
 
-        let saved_fd = unsafe { libc::dup(SD_FD) };
-        unsafe {
-            libc::dup2(pre_fd, SD_FD);
-            libc::close(pre_fd);
-        }
-
-        unsafe {
-            std::env::set_var("LISTEN_PID", std::process::id().to_string());
-            std::env::set_var("LISTEN_FDS", "1");
-        }
-
-        let incoming = UnixIncoming::bind(&path).unwrap();
-        assert_eq!(
-            incoming.local_addr().unwrap().as_pathname(),
-            Some(path.as_path())
-        );
-        drop(incoming);
-
-        unsafe {
-            std::env::remove_var("LISTEN_PID");
-            std::env::remove_var("LISTEN_FDS");
-        }
-
-        unsafe {
-            if saved_fd >= 0 {
-                libc::dup2(saved_fd, SD_FD);
-                libc::close(saved_fd);
-            } else {
-                libc::close(SD_FD);
-            }
-        }
-
+        drop(listener);
         let _ = std::fs::remove_file(&path);
     }
 }

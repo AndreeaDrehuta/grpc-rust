@@ -50,6 +50,9 @@ channel = [
 ]
 transport = ["server", "channel"]
 
+# Adopt listening sockets passed in by systemd.
+socket-activation = []
+
 # [[bench]]
 # name = "bench_main"
 # harness = false
@@ -101,8 +104,6 @@ quickcheck_macros = "1.0"
 static_assertions = "1.0"
 tokio = {version = "1.0", features = ["rt-multi-thread", "macros", "test-util"]}
 tower = {version = "0.5", features = ["load-shed", "timeout"]}
-libc = "0.2"
-serial_test = "3"
 
 [lints]
 workspace = true

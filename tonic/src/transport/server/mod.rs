@@ -5,7 +5,7 @@ mod display_error_stack;
 mod incoming;
 mod io_stream;
 mod service;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "socket-activation"))]
 mod socket_activation;
 #[cfg(feature = "_tls-any")]
 mod tls;

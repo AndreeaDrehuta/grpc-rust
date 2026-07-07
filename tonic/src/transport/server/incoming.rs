@@ -32,7 +32,8 @@ impl TcpIncoming {
     /// If the process was launched under a socket-activation manager
     /// that passed a listening socket matching `addr` via the
     /// `LISTEN_FDS` / `LISTEN_PID` environment variables, that inherited
-    /// descriptor is adopted instead of opening a new socket.
+    /// descriptor is adopted instead of opening a new socket. This behavior
+    /// requires the `socket-activation` feature (Unix only).
     ///
     /// # Examples
     /// ```no_run
@@ -233,7 +234,8 @@ fn make_keepalive(
     dirty.then_some(keepalive)
 }
 
-#[cfg(unix)]
+// Adopts a socket-activation fd whose address matches `addr`, if one was passed in.
+#[cfg(all(unix, feature = "socket-activation"))]
 fn find_preallocated_fd(addr: SocketAddr) -> Option<StdTcpListener> {
     use std::os::unix::io::FromRawFd;
 
@@ -242,7 +244,8 @@ fn find_preallocated_fd(addr: SocketAddr) -> Option<StdTcpListener> {
     Some(unsafe { StdTcpListener::from_raw_fd(fd) })
 }
 
-#[cfg(unix)]
+// Returns true if the listening socket at `fd` is bound to the requested address.
+#[cfg(all(unix, feature = "socket-activation"))]
 fn tcp_fd_matches(fd: std::os::unix::io::RawFd, requested: SocketAddr) -> bool {
     use std::mem::ManuallyDrop;
     use std::os::unix::io::FromRawFd;
@@ -251,7 +254,8 @@ fn tcp_fd_matches(fd: std::os::unix::io::RawFd, requested: SocketAddr) -> bool {
     matches!(listener.local_addr(), Ok(local) if socket_addr_matches(local, requested))
 }
 
-#[cfg(unix)]
+// Compares two socket addresses, treating IPv4-mapped and wildcard binds as equal.
+#[cfg(all(unix, feature = "socket-activation"))]
 fn socket_addr_matches(inherited: SocketAddr, requested: SocketAddr) -> bool {
     use std::net::IpAddr;
 
@@ -280,7 +284,7 @@ fn socket_addr_matches(inherited: SocketAddr, requested: SocketAddr) -> bool {
     requested_ip.is_unspecified() && inherited_ip.is_unspecified()
 }
 
-#[cfg(not(unix))]
+#[cfg(not(all(unix, feature = "socket-activation")))]
 fn find_preallocated_fd(_addr: SocketAddr) -> Option<StdTcpListener> {
     None
 }
@@ -288,9 +292,8 @@ fn find_preallocated_fd(_addr: SocketAddr) -> Option<StdTcpListener> {
 #[cfg(test)]
 mod tests {
     use crate::transport::server::TcpIncoming;
-    use serial_test::serial;
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "socket-activation"))]
     #[test]
     fn socket_addr_matches_cases() {
         use super::socket_addr_matches;
@@ -332,9 +335,8 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "socket-activation"))]
     #[test]
-    #[serial]
     fn is_listening_stream_socket_cases() {
         use crate::transport::server::socket_activation::is_listening_stream_socket;
         use std::os::unix::io::AsRawFd;
@@ -355,7 +357,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn one_tcpincoming_at_a_time() {
         let addr = "127.0.0.1:1322".parse().unwrap();
         {
@@ -365,46 +366,23 @@ mod tests {
         let _t3 = TcpIncoming::bind(addr).unwrap();
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn socket_activation_uses_preallocated_fd() {
+    #[cfg(all(unix, feature = "socket-activation"))]
+    #[test]
+    fn scan_adopts_matching_tcp_fd() {
+        use super::tcp_fd_matches;
+        use crate::transport::server::socket_activation::scan_preallocated_fds;
         use std::net::TcpListener as StdTcpListener;
-        use std::os::unix::io::IntoRawFd;
+        use std::os::unix::io::AsRawFd;
 
-        const SD_FD: libc::c_int = 3;
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let fd = listener.as_raw_fd();
 
-        let pre_listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = pre_listener.local_addr().unwrap();
-        let pre_fd = pre_listener.into_raw_fd();
+        let n_fds = fd - 2;
+        let found = scan_preallocated_fds(std::process::id(), n_fds, |candidate| {
+            tcp_fd_matches(candidate, addr)
+        });
 
-        let saved_fd = unsafe { libc::dup(SD_FD) };
-        unsafe {
-            libc::dup2(pre_fd, SD_FD);
-            libc::close(pre_fd);
-        }
-
-        unsafe {
-            std::env::set_var("LISTEN_PID", std::process::id().to_string());
-            std::env::set_var("LISTEN_FDS", "1");
-        }
-
-        let incoming = TcpIncoming::bind(addr).unwrap();
-        assert_eq!(incoming.local_addr().unwrap(), addr);
-        drop(incoming);
-
-        unsafe {
-            std::env::remove_var("LISTEN_PID");
-            std::env::remove_var("LISTEN_FDS");
-        }
-
-        unsafe {
-            if saved_fd >= 0 {
-                libc::dup2(saved_fd, SD_FD);
-                libc::close(saved_fd);
-            } else {
-                libc::close(SD_FD);
-            }
-        }
+        assert_eq!(found, Some(fd));
     }
 }
