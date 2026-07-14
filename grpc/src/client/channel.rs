@@ -36,7 +36,6 @@ use std::vec;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use url::Url; // NOTE: http::Uri requires non-empty authority portion of URI
 
 use crate::StatusCodeError;
 use crate::StatusError;
@@ -83,9 +82,7 @@ use crate::core::RequestHeaders;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;
-use crate::credentials::dyn_wrapper::DynChannelCredentials;
 use crate::rt;
-use crate::rt::GrpcEndpoint;
 use crate::rt::GrpcRuntime;
 use crate::rt::default_runtime;
 
@@ -167,11 +164,11 @@ impl Channel {
     /// Constructs a new gRPC channel.  Channel creation cannot fail, but if the
     /// target string is invalid, the returned channel will never connect, and
     /// will fail all RPCs.
-    pub fn new<C>(target: impl Into<String>, credentials: Arc<C>, options: ChannelOptions) -> Self
-    where
-        C: ChannelCredentials,
-        C::Output<Box<dyn GrpcEndpoint>>: GrpcEndpoint + 'static,
-    {
+    pub fn new(
+        target: impl Into<String>,
+        credentials: Arc<dyn ChannelCredentials>,
+        options: ChannelOptions,
+    ) -> Self {
         pick_first::reg();
         round_robin::reg();
         dns::reg();
@@ -186,7 +183,7 @@ impl Channel {
                 target,
                 default_runtime(),
                 options,
-                credentials as Arc<dyn DynChannelCredentials>,
+                credentials,
             )),
         }
     }
@@ -246,19 +243,18 @@ impl PersistentChannel {
         target: impl Into<String>,
         runtime: GrpcRuntime,
         options: ChannelOptions,
-        credentials: Arc<dyn DynChannelCredentials>,
+        credentials: Arc<dyn ChannelCredentials>,
     ) -> Self {
-        // TODO(arjan-bal): Return errors here instead of panicking.
-        let target = Url::from_str(&target.into()).unwrap();
+        // TODO(nathanielford): Return errors here instead of panicking.
+        let target = Target::from_str(&target.into()).unwrap();
         let resolver_builder = global_registry().get(target.scheme()).unwrap();
-        let target = name_resolution::Target::from(target);
         let authority = options
             .channel_authority
             .clone()
             .unwrap_or_else(|| resolver_builder.default_authority(&target).to_owned());
         let security_opts = SecurityOpts {
             credentials,
-            authority: parse_authority(&authority),
+            authority: Authority::from_host_port_str(&authority),
             handshake_info: ClientHandshakeInfo::default(),
         };
 
@@ -601,8 +597,8 @@ impl<T: Clone> WatcherIter<T> {
     }
 }
 
-/// Parses the host and port from a URL-encoded string. When the input can not
-/// be parsed as (host, port) pair, it returns the entire input as the host.
+/// Parses the host and port from a string. When the input can not be parsed
+/// as (host, port) pair, it returns the entire input as the host.
 fn parse_authority(host_and_port: &str) -> Authority {
     // Handle bracketed IPv6 addresses (e.g., "[::1]:80").
     if let Some(stripped) = host_and_port.strip_prefix('[')
@@ -619,164 +615,4 @@ fn parse_authority(host_and_port: &str) -> Authority {
         return Authority::new(host, Some(port));
     }
     Authority::new(host_and_port.to_string(), None)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_authority() {
-        struct TestCase {
-            input: &'static str,
-            expected: Authority,
-        }
-
-        let cases = [
-            TestCase {
-                input: "localhost:http",
-                expected: Authority::new("localhost:http", None),
-            },
-            TestCase {
-                input: "localhost:80",
-                expected: Authority::new("localhost", Some(80)),
-            },
-            // host name with zone identifier.
-            TestCase {
-                input: "localhost%lo0:80",
-                expected: Authority::new("localhost%lo0", Some(80)),
-            },
-            TestCase {
-                input: "localhost%lo0:http",
-                expected: Authority::new("localhost%lo0:http", None),
-            },
-            TestCase {
-                input: "[localhost%lo0]:http",
-                expected: Authority::new("[localhost%lo0]:http", None),
-            },
-            TestCase {
-                input: "[localhost%lo0]:80",
-                expected: Authority::new("localhost%lo0", Some(80)),
-            },
-            // IP literal
-            TestCase {
-                input: "127.0.0.1:http",
-                expected: Authority::new("127.0.0.1:http", None),
-            },
-            TestCase {
-                input: "127.0.0.1:80",
-                expected: Authority::new("127.0.0.1", Some(80)),
-            },
-            TestCase {
-                input: "[::1]:http",
-                expected: Authority::new("[::1]:http", None),
-            },
-            TestCase {
-                input: "[::1]:80",
-                expected: Authority::new("::1", Some(80)),
-            },
-            // IP literal with zone identifier.
-            TestCase {
-                input: "[::1%lo0]:http",
-                expected: Authority::new("[::1%lo0]:http", None),
-            },
-            TestCase {
-                input: "[::1%lo0]:80",
-                expected: Authority::new("::1%lo0", Some(80)),
-            },
-            TestCase {
-                input: ":http",
-                expected: Authority::new(":http", None),
-            },
-            TestCase {
-                input: ":80",
-                expected: Authority::new("", Some(80)),
-            },
-            TestCase {
-                input: "grpc.io:",
-                expected: Authority::new("grpc.io:", None),
-            },
-            TestCase {
-                input: "127.0.0.1:",
-                expected: Authority::new("127.0.0.1:", None),
-            },
-            TestCase {
-                input: "[::1]:",
-                expected: Authority::new("[::1]:", None),
-            },
-            TestCase {
-                input: "grpc.io:https%foo",
-                expected: Authority::new("grpc.io:https%foo", None),
-            },
-            TestCase {
-                input: "grpc.io",
-                expected: Authority::new("grpc.io", None),
-            },
-            TestCase {
-                input: "127.0.0.1",
-                expected: Authority::new("127.0.0.1", None),
-            },
-            TestCase {
-                input: "[::1]",
-                expected: Authority::new("[::1]", None),
-            },
-            TestCase {
-                input: "[fe80::1%lo0]",
-                expected: Authority::new("[fe80::1%lo0]", None),
-            },
-            TestCase {
-                input: "[localhost%lo0]",
-                expected: Authority::new("[localhost%lo0]", None),
-            },
-            TestCase {
-                input: "localhost%lo0",
-                expected: Authority::new("localhost%lo0", None),
-            },
-            TestCase {
-                input: "::1",
-                expected: Authority::new("::1", None),
-            },
-            TestCase {
-                input: "fe80::1%lo0",
-                expected: Authority::new("fe80::1%lo0", None),
-            },
-            TestCase {
-                input: "fe80::1%lo0:80",
-                expected: Authority::new("fe80::1%lo0:80", None),
-            },
-            TestCase {
-                input: "[foo:bar]",
-                expected: Authority::new("[foo:bar]", None),
-            },
-            TestCase {
-                input: "[foo:bar]baz",
-                expected: Authority::new("[foo:bar]baz", None),
-            },
-            TestCase {
-                input: "[foo]bar:baz",
-                expected: Authority::new("[foo]bar:baz", None),
-            },
-            TestCase {
-                input: "[foo]:[bar]:baz",
-                expected: Authority::new("[foo]:[bar]:baz", None),
-            },
-            TestCase {
-                input: "[foo]:[bar]baz",
-                expected: Authority::new("[foo]:[bar]baz", None),
-            },
-            TestCase {
-                input: "foo[bar]:baz",
-                expected: Authority::new("foo[bar]:baz", None),
-            },
-            TestCase {
-                input: "foo]bar:baz",
-                expected: Authority::new("foo]bar:baz", None),
-            },
-        ];
-
-        for TestCase { input, expected } in cases {
-            let auth = parse_authority(input);
-            assert_eq!(auth, expected, "authority mismatch for {}", input);
-        }
-    }
 }

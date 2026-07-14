@@ -43,6 +43,8 @@ tokio = { version = "1", features = ["sync", "time"] }
 # Used for weighted cluster selection and fractional route matching — does not need
 # cryptographic security, only statistical uniformity for traffic distribution.
 fastrand = "2"
+# gRFC A42 ring-hash: XXH64 (seed 0) for the request hash and ring construction.
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 indexmap = "2"
 tracing = "0.1"
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -66,6 +68,7 @@ tonic-prost-build = "0.14"
 async-stream = "0.3"
 tempfile = "3.27.0"
 rcgen = "0.14"
+google-cloud-auth = { version = "1.9", default-features = false }
 
 [features]
 testutil = ["dep:tonic-prost"]
@@ -78,6 +81,10 @@ tls-aws-lc = ["_tls-any", "tonic/tls-aws-lc", "xds-client/tonic-tls-aws-lc"]
 [[example]]
 name = "channel"
 required-features = ["testutil"]
+
+[[example]]
+name = "channel_with_google_default"
+required-features = ["testutil", "tls-ring"]
 
 [[example]]
 name = "greeter_server"

@@ -86,6 +86,25 @@ server instead:
 $ cargo run --bin routeguide-server
 ```
 
+## Google Cloud Pub/Sub Example
+This example demonstrates fetching a list of topics from the Cloud Pub/Sub API. 
+The request is secured using an OAuth token and TLS.
+
+### Client
+
+Ensure your environment has [Application Default Credentials] configured.
+You can do this by setting the `GOOGLE_APPLICATION_CREDENTIALS` environment
+variable, or by running the `gcloud auth application-default login` command.
+
+Once your credentials are set up, you will need your GCP Project ID, which can
+be found on the main dashboard of the Google Cloud Console. With both of these
+ready, you can run the example like so:
+```bash
+$ cargo run --bin grpc-gcp-client -- <project-id>
+```
+
+[Application Default Credentials]: https://docs.cloud.google.com/docs/authentication/application-default-credentials
+
 ## Helloworld
 
 ### Client
@@ -213,6 +232,23 @@ The autoload example requires the following crates installed globally:
 
 * [systemfd](https://crates.io/crates/systemfd)
 * [cargo-watch](https://crates.io/crates/cargo-watch)
+
+## Socket Activation (systemd)
+
+The servers adopt a listening socket passed by a socket-activation manager (via
+`LISTEN_FDS`/`LISTEN_PID`), or bind directly otherwise.
+
+### TCP
+
+```bash
+$ ./src/socket_activation/test_tcp.sh
+```
+
+### Unix domain socket
+
+```bash
+$ ./src/socket_activation/test_uds.sh
+```
 
 ## Richer Error
 
