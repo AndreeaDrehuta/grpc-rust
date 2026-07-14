@@ -241,6 +241,8 @@ fn find_preallocated_fd(addr: SocketAddr) -> Option<StdTcpListener> {
 
     let fd = super::socket_activation::find_preallocated_fd(|fd| tcp_fd_matches(fd, addr))?;
 
+    // SAFETY: `fd` is a validated, open activation descriptor. Ownership is taken
+    // once here, the returned listener becomes its sole owner.
     Some(unsafe { StdTcpListener::from_raw_fd(fd) })
 }
 
@@ -250,6 +252,9 @@ fn tcp_fd_matches(fd: std::os::unix::io::RawFd, requested: SocketAddr) -> bool {
     use std::mem::ManuallyDrop;
     use std::os::unix::io::FromRawFd;
 
+    // SAFETY: `fd` is a valid, open activation descriptor. `ManuallyDrop` keeps
+    // ownership with the caller so it is not closed here, it is only borrowed to
+    // read the bound address.
     let listener = ManuallyDrop::new(unsafe { StdTcpListener::from_raw_fd(fd) });
     matches!(listener.local_addr(), Ok(local) if socket_addr_matches(local, requested))
 }

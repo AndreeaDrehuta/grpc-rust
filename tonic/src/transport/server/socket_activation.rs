@@ -31,7 +31,9 @@ where
 
 /// Returns `true` if `fd` refers to a stream socket in the listening state.
 pub(super) fn is_listening_stream_socket(fd: RawFd) -> bool {
-    // Borrow the fd without taking ownership so the socket is not closed here.
+    // SAFETY: `fd` is a valid, open descriptor from the activation range. It is
+    // only borrowed, not owned: the `BorrowedFd` does not close it on drop and
+    // does not outlive this function.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     let sock = socket2::SockRef::from(&borrowed);
 
